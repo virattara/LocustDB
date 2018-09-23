@@ -1,425 +1,143 @@
-#![allow(unused_parens)]
-
-use engine::aggregator::Aggregator;
-use engine::query::*;
-use ingest::raw_val::RawVal;
-use nom::{digit, is_alphabetic, is_alphanumeric, multispace};
-use std::boxed::Box;
-use std::str;
-use std::str::FromStr;
+use sqlparser::sqlparser::*;
+use sqlparser::sqlast::*;
+use engine::query::Query;
 use syntax::expression::*;
-use syntax::limit::LimitClause;
-use time;
+use engine::aggregator::*;
+use ingest::raw_val::RawVal;
+use syntax::limit::*;
 
+pub fn parse_query(query: &str) -> Result<Query, ParserError> {
+    let ast = Parser::parse_sql(query.to_string())?;
 
-named!(pub parse_query<&[u8], Query>, alt_complete!(full_query | simple_query));
+    let mut select = Vec::<Expr>::new();
+    let mut aggregate = Vec::<(Aggregator, Expr)>::new();
+    let mut table = String::new();
+    let mut filter = Expr::Const(RawVal::Int(1));
+    let mut order_by_str = None;
+    let mut order_desc = false;
+    let mut limit_clause = LimitClause { limit: 100, offset: 0 };
+    let order_by_index = None;
 
-named!(full_query<&[u8], Query>,
-    do_parse!(
-        opt!(multispace) >>
-        tag_no_case!("select") >>
-        multispace >>
-        select: select_clauses >>
-        opt!(multispace) >>
-        table: from_clause >>
-        multispace >>
-        tag_no_case!("where") >>
-        multispace >>
-        filter: expr >>
-        opt!(multispace) >>
-        order_by: opt!(order_by_clause) >>
-        opt!(multispace) >>
-        limit: opt!(limit_clause) >>
-        opt!(multispace) >>
-        char!(';') >>
-        (construct_query(select, table, filter, order_by, limit))
-    )
-);
+    if let ASTNode::SQLSelect 
+        {projection, relation, selection, order_by, limit, .. } = ast.to_owned() 
+    {
+        for elem in projection {
+            match elem.to_owned() {
+                ASTNode::SQLIdentifier(expr) => 
+                    select.push(Expr::ColName(expr)),
+                ASTNode::SQLLiteralLong(constant) => 
+                    select.push(Expr::Const(RawVal::Int(constant))),
+                ASTNode::SQLWildcard => 
+                    select.push(Expr::ColName('*'.to_string())),
+                ASTNode::SQLFunction{id, args} => {
+                    let aggregator = match id.to_uppercase().as_ref() {
+                        "COUNT" => Aggregator::Count,
+                        "SUM" => Aggregator::Sum,
+                        _ => panic!("Unknown aggregate fn"),
+                    };
 
+                    let expr = match args[0].to_owned() {
+                        ASTNode::SQLLiteralLong(literal) => 
+                            Expr::Const(RawVal::Int(literal)),
+                        ASTNode::SQLIdentifier(identifier) => 
+                            Expr::ColName(identifier),
+                        ASTNode::SQLBinaryExpr{left, op, right} => 
+                            generate_expression(ASTNode::SQLBinaryExpr{left, op, right}),
+                        _ => Expr::Const(RawVal::Int(1))
+                    };
 
-named!(simple_query<&[u8], Query>,
-    do_parse!(
-        opt!(multispace) >>
-        tag_no_case!("select") >>
-        multispace >>
-        select: select_clauses >>
-        opt!(multispace) >>
-        table: from_clause >>
-        opt!(multispace) >>
-        order_by: opt!(order_by_clause) >>
-        opt!(multispace) >>
-        limit: opt!(limit_clause) >>
-        opt!(multispace) >>
-        opt!(char!(';')) >>
-        (construct_query(select, table, Expr::Const(RawVal::Int(1)), order_by, limit))
-    )
-);
+                    aggregate.push((aggregator, expr));
+                },
+                _ => eprintln!("Unknown Pattern {:?}", elem),
+            }
+        }
 
-fn construct_query(select_clauses: Vec<AggregateOrSelect>,
-                   table: &str,
-                   filter: Expr,
-                   order_by: Option<(String, bool)>,
-                   limit: Option<LimitClause>)
-                   -> Query {
-    let (select, aggregate) = partition(select_clauses);
-    let order_desc = order_by.as_ref().map(|x| x.1).unwrap_or(false);
-    Query {
+        table = match relation {
+            Some(sql_identifier) => {
+                if let ASTNode::SQLIdentifier(tb) = *sql_identifier {
+                   tb
+                } else {
+                    return Err(ParserError::ParserError(format!("Failed to parse: No table selected.")));
+                }
+            },
+            None => {
+                return Err(ParserError::ParserError(format!("Failed to parse: No table selected.")));
+            }
+        };
+
+        filter = match selection {
+            Some(binary_expr) => generate_expression(*binary_expr),
+            None => Expr::Const(RawVal::Int(1))
+        };
+
+        match order_by {
+            Some(sql_order_by) => if let ASTNode::SQLOrderBy{expr, asc} =  sql_order_by[0].to_owned() {
+                if let ASTNode::SQLIdentifier(identifier) = *expr {
+                    order_by_str = Some(identifier);
+                }
+                order_desc = asc;
+            },
+            None => (),
+        };
+
+        match limit {
+            Some(sql_limit) => if let ASTNode::SQLLiteralLong(literal) = *sql_limit {
+                limit_clause = LimitClause { limit: literal as u64, offset: 0 };
+            },
+            None => (),
+        };
+    }
+
+    let result = Query {
         select,
-        table: table.to_string(),
+        table,
         filter,
         aggregate,
-        order_by: order_by.map(|x| x.0),
+        order_by: order_by_str,
         order_desc,
-        limit: limit.unwrap_or(LimitClause { limit: 100, offset: 0 }),
-        order_by_index: None,
-    }
+        limit: limit_clause,
+        order_by_index,
+    };
+
+    Ok(result)
 }
 
-fn partition(select_or_aggregates: Vec<AggregateOrSelect>)
-             -> (Vec<Expr>, Vec<(Aggregator, Expr)>) {
-    let (selects, aggregates): (Vec<AggregateOrSelect>, Vec<AggregateOrSelect>) =
-        select_or_aggregates.into_iter()
-            .partition(|x| match *x {
-                AggregateOrSelect::Select(_) => true,
-                _ => false,
-            });
+fn generate_expression(binary_expr: ASTNode) -> Expr {
+    if let ASTNode::SQLBinaryExpr{left, op, right} = binary_expr {
+        let operator = match op {
+            SQLOperator::And => Func2Type::And,
+            SQLOperator::Plus => Func2Type::Add,
+            SQLOperator::Minus => Func2Type::Subtract,
+            SQLOperator::Multiply => Func2Type::Multiply,
+            SQLOperator::Divide => Func2Type::Divide,
+            SQLOperator::Gt => Func2Type::GT,
+            SQLOperator::Lt => Func2Type::LT,
+            SQLOperator::Eq => Func2Type::Equals,
+            SQLOperator::NotEq => Func2Type::NotEquals,
+            SQLOperator::Or => Func2Type::Or,
+            _ => {
+                eprintln!("Unknown operator {:?}", op);
+                Func2Type::Equals
+            },
+        };
 
-    (selects.into_iter()
-         .filter_map(|x| match x {
-             AggregateOrSelect::Select(expr) => Some(expr),
-             _ => None,
-         })
-         .collect(),
-     aggregates.into_iter()
-         .filter_map(|x| match x {
-             AggregateOrSelect::Aggregate(agg) => Some(agg),
-             _ => None,
-         })
-         .collect())
-}
+        let lhs = match *left {
+            ASTNode::SQLLiteralLong(literal) => Box::new(Expr::Const(RawVal::Int(literal))),
+            ASTNode::SQLIdentifier(identifier) => Box::new(Expr::ColName(identifier)),
+            _ => Box::new(Expr::Const(RawVal::Int(1)))
+        };
 
-named!(from_clause<&[u8], &str>,
-    do_parse!(
-        tag_no_case!("from") >>
-        multispace >>
-        from: identifier >>
-        (from)
-    )
-);
+        let rhs = match *right {
+            ASTNode::SQLLiteralLong(literal) => Box::new(Expr::Const(RawVal::Int(literal))),
+            ASTNode::SQLIdentifier(identifier) => Box::new(Expr::ColName(identifier)),
+            _ => Box::new(Expr::Const(RawVal::Int(1)))
+        };
 
-named!(select_clauses<&[u8], Vec<AggregateOrSelect>>,
-    alt!(
-        do_parse!(
-            opt!(multispace) >>
-            tag!("*") >>
-            opt!(multispace) >>
-            (vec![AggregateOrSelect::Select(Expr::ColName("*".to_string()))])
-        ) |
-        separated_list!(
-            tag!(","),
-            alt_complete!(aggregate_clause | select_clause)
-        )
-    )
-);
-
-named!(aggregate_clause<&[u8], AggregateOrSelect>,
-    do_parse!(
-        opt!(multispace) >>
-        atype: aggregate_func >>
-        char!('(') >>
-        e: expr >>
-        opt!(multispace) >>
-        char!(')') >>
-        (AggregateOrSelect::Aggregate((atype, e)))
-    )
-);
-
-named!(select_clause<&[u8], AggregateOrSelect>, map!(expr, AggregateOrSelect::Select));
-
-named!(aggregate_func<&[u8], Aggregator>, alt!(count | sum));
-
-named!(count<&[u8], Aggregator>,
-    map!( tag_no_case!("count"), |_| Aggregator::Count )
-);
-
-named!(sum<&[u8], Aggregator>,
-    map!( tag_no_case!("sum"), |_| Aggregator::Sum )
-);
-
-named!(expr<&[u8], Expr>,
-    do_parse!(
-        opt!(multispace) >>
-        result: alt!(infix_expr | expr_no_left_recur) >>
-        (result)
-    )
-);
-
-named!(expr_no_left_recur<&[u8], Expr>,
-    do_parse!(
-        opt!(multispace) >>
-        result: alt!(parentheses | template | function | to_year | negation | colname | constant) >>
-        (result)
-    )
-);
-
-named!(parentheses<&[u8], Expr>,
-    do_parse!(
-        char!('(') >>
-        e1: expr >>
-        opt!(multispace) >>
-        char!(')') >>
-        (e1)
-    )
-);
-
-named!(template<&[u8], Expr>,
-    alt!( last_hour | last_day )
-);
-
-named!(last_hour<&[u8], Expr>,
-    map!(
-        tag_no_case!("$LAST_HOUR"),
-        |_| Expr::Func2(
-                Func2Type::GT,
-                Box::new(Expr::ColName("timestamp".to_string())),
-                Box::new(Expr::Const(RawVal::Int(time::now().to_timespec().sec - 3600)))
-        )
-    )
-);
-
-named!(last_day<&[u8], Expr>,
-    map!(
-        tag_no_case!("$LAST_DAY"),
-        |_| Expr::Func2(
-                Func2Type::GT,
-                Box::new(Expr::ColName("timestamp".to_string())),
-                Box::new(Expr::Const(RawVal::Int(time::now().to_timespec().sec - 86400)))
-        )
-    )
-);
-
-named!(function<&[u8], Expr>,
-    do_parse!(
-        ft: function_name >>
-        char!('(') >>
-        e1: expr >>
-        opt!(multispace) >>
-        char!(',') >>
-        e2: expr >>
-        opt!(multispace) >>
-        char!(')') >>
-        (Expr::func(ft, e1, e2))
-    )
-);
-
-named!(infix_expr<&[u8], Expr>,
-    do_parse!(
-        e1: expr_no_left_recur >>
-        opt!(multispace) >>
-        ft: infix_function_name >>
-        e2: expr >>
-        (Expr::func(ft, e1, e2))
-    )
-);
-
-named!(negation<&[u8], Expr>,
-    do_parse!(
-        char!('-') >>
-        opt!(multispace) >>
-        e: expr >>
-        (Expr::func1(Func1Type::Negate, e))
-    )
-);
-
-named!(to_year<&[u8], Expr>,
-    do_parse!(
-        tag!("to_year") >>
-        opt!(multispace) >>
-        char!('(') >>
-        opt!(multispace) >>
-        e: expr >>
-        opt!(multispace) >>
-        char!(')') >>
-        (Expr::func1(Func1Type::ToYear, e))
-    )
-);
-
-named!(constant<&[u8], Expr>,
-    map!(
-        alt!(integer |  string),
-        Expr::Const
-    )
-);
-
-
-named!(integer<&[u8], RawVal>,
-    map!(
-        map_res!(
-            map_res!(
-                digit,
-                str::from_utf8
-            ),
-            FromStr::from_str
-        ),
-        RawVal::Int
-    )
-);
-
-named!(number<&[u8], u64>,
-    map_res!(
-        map_res!(
-            digit,
-            str::from_utf8
-        ),
-        FromStr::from_str
-    )
-);
-
-named!(string<&[u8], RawVal>,
-    alt!(
-        do_parse!(
-            char!('"') >>
-            s: is_not!("\"") >>
-            char!('"') >>
-            (RawVal::Str(str::from_utf8(s).unwrap().to_string()))
-        ) |
-        do_parse!(
-            tag!("\"\"") >>
-            (RawVal::Str("".to_string()))
-        )
-    )
-);
-
-named!(colname<&[u8], Expr>,
-    map!(
-        identifier,
-        |ident: &str| Expr::ColName(ident.to_string())
-    )
-);
-
-named!(function_name<&[u8], Func2Type>,
-    alt!( infix_function_name | regex )
-);
-
-named!(infix_function_name<&[u8], Func2Type>,
-    alt!( equals | not_equals | and | or | greater | less | add | subtract | divide | multiply )
-);
-
-named!(divide<&[u8], Func2Type>,
-    map!( tag!("/"), |_| Func2Type::Divide)
-);
-
-named!(add<&[u8], Func2Type>,
-    map!( tag!("+"), |_| Func2Type::Add)
-);
-
-named!(multiply<&[u8], Func2Type>,
-    map!( tag!("*"), |_| Func2Type::Multiply)
-);
-
-named!(subtract<&[u8], Func2Type>,
-    map!( tag!("-"), |_| Func2Type::Subtract)
-);
-
-named!(equals<&[u8], Func2Type>,
-    map!( tag!("="), |_| Func2Type::Equals)
-);
-
-named!(not_equals<&[u8], Func2Type>,
-    map!( tag!("<>"), |_| Func2Type::NotEquals)
-);
-
-named!(greater<&[u8], Func2Type>,
-    map!( tag!(">"), |_| Func2Type::GT)
-);
-
-named!(less<&[u8], Func2Type>,
-    map!( tag!("<"), |_| Func2Type::LT)
-);
-
-named!(and<&[u8], Func2Type>,
-    map!( tag_no_case!("and"), |_| Func2Type::And)
-);
-
-named!(or<&[u8], Func2Type>,
-    map!( tag_no_case!("or"), |_| Func2Type::Or)
-);
-
-named!(regex<&[u8], Func2Type>,
-    map!( tag_no_case!("regex"), |_| Func2Type::RegexMatch)
-);
-
-
-named!(identifier<&[u8], &str>,
-    map_res!(
-        take_while1!(is_ident_char),
-        create_sql_identifier
-    )
-);
-
-fn create_sql_identifier(bytes: &[u8]) -> Result<&str, String> {
-    if is_ident_start_char(bytes[0]) {
-        str::from_utf8(bytes).map_err(|_| "UTF8Error".to_string())
+        Expr::Func2(operator, lhs, rhs)
     } else {
-        Err("Identifier must not start with number.".to_string())
+        Expr::Const(RawVal::Int(1))
     }
 }
-
-fn is_ident_start_char(chr: u8) -> bool {
-    is_alphabetic(chr) || chr == b'_'
-}
-
-fn is_ident_char(chr: u8) -> bool {
-    is_alphanumeric(chr) || chr == b'_'
-}
-
-named!(limit_clause<&[u8], LimitClause>,
-    do_parse!(
-        tag_no_case!("limit") >>
-        multispace >>
-        limit_val: number >>
-        offset_val: opt!(
-            do_parse!(
-                multispace >>
-                tag_no_case!("offset") >>
-                multispace >>
-                val: number >>
-                (val)
-            )) >>
-        (LimitClause{limit: limit_val,
-                     offset: match offset_val {
-                                 Some(inner) => inner,
-                                 None => 0,
-                             }
-                    })
-    )
-);
-
-named!(order_by_clause<&[u8], (String, bool)>,
-    alt!(
-        do_parse!(
-            tag_no_case!("order by") >>
-            multispace >>
-            order_by: identifier >>
-            multispace >>
-            tag_no_case!("desc") >>
-            (order_by.to_string(), true)
-        ) |
-        do_parse!(
-            tag_no_case!("order by") >>
-            multispace >>
-            order_by: identifier >>
-            opt!(preceded!(multispace, tag_no_case!("asc"))) >>
-            (order_by.to_string(), false)
-        )
-    )
-);
-
-enum AggregateOrSelect {
-    Aggregate((Aggregator, Expr)),
-    Select(Expr),
-}
-
 
 #[cfg(test)]
 mod tests {

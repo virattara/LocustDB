@@ -1,6 +1,7 @@
 #![feature(fn_traits, integer_atomics, refcell_replace_swap, specialization, trait_alias, core_intrinsics, box_patterns, int_to_from_bytes)]
 #[macro_use]
 extern crate nom;
+extern crate sqlparser;
 #[macro_use]
 extern crate failure_derive;
 #[macro_use]

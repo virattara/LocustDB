@@ -9,6 +9,7 @@ extern crate rustyline;
 extern crate time;
 extern crate env_logger;
 extern crate log;
+extern crate sqlparser;
 
 use failure::Fail;
 use futures_executor::block_on;
@@ -186,8 +187,8 @@ fn repl(locustdb: &LocustDB) {
             break;
         }
         rl.add_history_entry(&s);
-        if !s.ends_with(';') {
-            s.push(';');
+        if s.ends_with(';') {
+            s.pop();
         }
 
         let mut print_trace = false;
